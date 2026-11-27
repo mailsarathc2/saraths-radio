@@ -4,22 +4,18 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.MediaPlayer
 import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
-import androidx.media3.common.AudioAttributes
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
 
-class RadioPlaybackService : MediaSessionService() {
+class RadioPlaybackService : Service() {
 
-    private var player: ExoPlayer? = null
-    private var mediaSession: MediaSession? = null
+    private var mediaPlayer: MediaPlayer? = null
     private var currentStreamUrl: String = ""
     private lateinit var prefs: RadioPreferences
 
@@ -36,49 +32,15 @@ class RadioPlaybackService : MediaSessionService() {
         super.onCreate()
         prefs = RadioPreferences(this)
         createNotificationChannel()
-
-        val audioAttributes = AudioAttributes.Builder()
-            .setUsage(C.USAGE_ALARM)
-            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-            .build()
-
-        player = ExoPlayer.Builder(this)
-            .setAudioAttributes(audioAttributes, true)
-            .setWakeMode(C.WAKE_MODE_NETWORK)
-            .build()
-            .apply {
-                addListener(object : Player.Listener {
-                    override fun onPlayerError(error: PlaybackException) {
-                        if (currentStreamUrl.isNotBlank()) {
-                            setMediaItem(MediaItem.fromUri(currentStreamUrl))
-                            prepare()
-                            play()
-                        }
-                    }
-                })
-            }
-
-        applySavedVolume()
-        mediaSession = MediaSession.Builder(this, player!!).build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        super.onStartCommand(intent, flags, startId)
-
         when (intent?.action) {
             CMD_PLAY -> {
                 val url = intent.getStringExtra(EXTRA_URL) ?: return START_NOT_STICKY
                 currentStreamUrl = url
-                applySavedVolume()
                 startForeground(NOTIFICATION_ID, buildNotification("Playing Sarath's Radio..."))
-
-                player?.apply {
-                    stop()
-                    clearMediaItems()
-                    setMediaItem(MediaItem.fromUri(url))
-                    prepare()
-                    play()
-                }
+                startStreaming(url)
             }
 
             CMD_UPDATE_AUDIO -> {
@@ -92,14 +54,55 @@ class RadioPlaybackService : MediaSessionService() {
         return START_STICKY
     }
 
+    private fun startStreaming(url: String) {
+        releasePlayer()
+        try {
+            mediaPlayer = MediaPlayer().apply {
+                setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                setDataSource(url)
+                setOnPreparedListener { mp ->
+                    applySavedVolume()
+                    mp.start()
+                }
+                setOnErrorListener { _, _, _ ->
+                    if (currentStreamUrl.isNotBlank()) {
+                        startStreaming(currentStreamUrl)
+                    }
+                    true
+                }
+                prepareAsync()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private fun applySavedVolume() {
-        player?.volume = if (prefs.isMuted) 0f else prefs.volumeLevel
+        val vol = if (prefs.isMuted) 0f else prefs.volumeLevel
+        try {
+            mediaPlayer?.setVolume(vol, vol)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releasePlayer() {
+        try {
+            mediaPlayer?.stop()
+            mediaPlayer?.release()
+        } catch (_: Exception) {
+        }
+        mediaPlayer = null
     }
 
     private fun stopPlaybackAndService() {
         currentStreamUrl = ""
-        player?.stop()
-        player?.clearMediaItems()
+        releasePlayer()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -145,15 +148,10 @@ class RadioPlaybackService : MediaSessionService() {
         }
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        mediaSession?.run {
-            player.release()
-            release()
-            mediaSession = null
-        }
-        player = null
+        releasePlayer()
         super.onDestroy()
     }
 }
